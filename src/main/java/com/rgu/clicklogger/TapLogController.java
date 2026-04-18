@@ -1,6 +1,7 @@
 package com.rgu.clicklogger;
 
 import com.google.cloud.firestore.DocumentReference;
+import com.google.cloud.firestore.DocumentSnapshot;
 import com.google.cloud.firestore.FieldValue;
 import com.google.cloud.firestore.Firestore;
 import com.google.cloud.firestore.SetOptions;
@@ -12,8 +13,10 @@ import org.springframework.web.bind.annotation.*;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @RestController
 @RequestMapping("/api/taps")
@@ -38,22 +41,44 @@ public class TapLogController {
 
             Firestore db = FirestoreClient.getFirestore();
 
-            // Extract session-level metadata from payload + first tap
             String sessionId = payload.getSessionId();
             String devicePlatform = payload.getDevicePlatform();
-            TapEntry firstTap = payload.getTaps().get(0);
-            String interfaceType = firstTap.getInterfaceType();
-            int interfaceSequence = firstTap.getInterfaceSequence();
             int tapCount = payload.getTaps().size();
 
             // ============================================================
-            // 2. BUILD WRITE BATCH — atomic, single network round-trip
-            //    Why: 50 separate .add() calls = 50 network calls + no
-            //    atomicity guarantee. WriteBatch = 1 call + all-or-nothing.
+            // 2. AGGREGATE METADATA ACROSS ALL TAPS IN THE BATCH
+            //    A single POST may contain taps from multiple interface
+            //    variations (e.g., 50 feedbackshown + 50 nofeedback).
+            //    Collect the full set of interfaces seen and the max
+            //    sequence number so session metadata reflects reality.
+            // ============================================================
+            Set<String> interfaceTypesInBatch = new HashSet<>();
+            int maxInterfaceSeq = 0;
+            for (TapEntry tap : payload.getTaps()) {
+                interfaceTypesInBatch.add(tap.getInterfaceType());
+                if (tap.getInterfaceSequence() > maxInterfaceSeq) {
+                    maxInterfaceSeq = tap.getInterfaceSequence();
+                }
+            }
+
+            // ============================================================
+            // 3. CHECK IF SESSION IS NEW
+            //    Required so created_at is set only once — SetOptions.merge()
+            //    would otherwise overwrite it on later interface submits.
+            // ============================================================
+            DocumentReference sessionRef = db.collection("sessions").document(sessionId);
+            DocumentSnapshot existingSession = sessionRef.get().get();
+            boolean isNewSession = !existingSession.exists();
+
+            // ============================================================
+            // 4. BUILD WRITE BATCH — atomic, single network round-trip
+            //    Rationale: 100 separate .add() calls = 100 network calls
+            //    with no atomicity guarantee. WriteBatch = 1 call with
+            //    all-or-nothing semantics.
             // ============================================================
             WriteBatch batch = db.batch();
 
-            // --- 2a. Write all taps to tap_logs collection ---
+            // --- 4a. Write all taps to tap_logs collection ---
             for (TapEntry tap : payload.getTaps()) {
                 long durationMs = tap.getEndTimestamp() - tap.getStartTimestamp();
 
@@ -72,43 +97,44 @@ public class TapLogController {
                 batch.set(tapRef, tapRecord);
             }
 
-            // --- 2b. Create/update session document ---
-            // Using SetOptions.merge() so that:
-            //   - Interface 1 arrives: creates doc with created_at
-            //   - Interface 2 arrives: merges, appends to interfaces_completed
-            DocumentReference sessionRef = db.collection("sessions").document(sessionId);
-
+            // --- 4b. Create/update session document ---
+            // SetOptions.merge() semantics:
+            //   - New session  → creates the document
+            //   - Existing doc → merges fields (arrayUnion appends,
+            //     increment adds atomically, last_activity_at overwrites)
             Map<String, Object> sessionUpdate = new HashMap<>();
             sessionUpdate.put("session_id", sessionId);
             sessionUpdate.put("device_platform", devicePlatform);
             sessionUpdate.put("last_activity_at", FieldValue.serverTimestamp());
-            sessionUpdate.put("interfaces_completed", FieldValue.arrayUnion(interfaceType));
-            sessionUpdate.put("max_interface_sequence", interfaceSequence);
+            sessionUpdate.put("interfaces_completed",
+                    FieldValue.arrayUnion(interfaceTypesInBatch.toArray()));
+            sessionUpdate.put("max_interface_sequence", maxInterfaceSeq);
             sessionUpdate.put("total_taps", FieldValue.increment(tapCount));
-            sessionUpdate.put("completed_both", interfaceSequence >= 2);
+            sessionUpdate.put("completed_both", maxInterfaceSeq >= 2);
 
-            // created_at set only on first interface (won't overwrite on interface 2)
-            if (interfaceSequence == 1) {
+            // created_at: set ONLY on first write — preserves original creation time
+            if (isNewSession) {
                 sessionUpdate.put("created_at", FieldValue.serverTimestamp());
             }
 
             batch.set(sessionRef, sessionUpdate, SetOptions.merge());
 
             // ============================================================
-            // 3. COMMIT ATOMICALLY — awaited via .get()
-            //    If this fails, NOTHING is written (no partial state).
+            // 5. COMMIT ATOMICALLY — awaited via .get()
+            //    On failure, no documents are written (no partial state).
             // ============================================================
             batch.commit().get();
 
             // ============================================================
-            // 4. RESPONSE
+            // 6. RESPONSE
             // ============================================================
             Map<String, Object> response = new HashMap<>();
             response.put("status", "success");
             response.put("taps_saved", tapCount);
             response.put("session_id", sessionId);
-            response.put("interface_sequence", interfaceSequence);
-            response.put("interface_type", interfaceType);
+            response.put("max_interface_sequence", maxInterfaceSeq);
+            response.put("interfaces_in_batch", interfaceTypesInBatch);
+            response.put("is_new_session", isNewSession);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
 
         } catch (Exception e) {
